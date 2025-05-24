@@ -1,152 +1,291 @@
 import random
 import re
 import os
+import logging
+from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass
+from pathlib import Path
 
-# Helper function to read lines from a file
-def read_lines_from_file(filepath):
-    """Reads lines from a file, stripping whitespace. Handles file not found."""
-    if not os.path.exists(filepath):
-        print(f"Warning: File not found - {filepath}")
-        return []
-    try:
-        with open(filepath, 'r', encoding='utf-8') as f:
-            return [line.strip() for line in f if line.strip()]
-    except Exception as e:
-        print(f"Error reading file {filepath}: {e}")
-        return []
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# Helper function to parse replacement rules
-def parse_rules(rules_str):
-    """Parses 'old->new' rules from a multiline string."""
-    rules = []
-    for line in rules_str.splitlines():
-        if '->' in line:
-            old, new = line.split('->', 1)
-            rules.append((old.strip(), new.strip()))
-    return rules
+@dataclass
+class OutfitDistribution:
+    """Represents an outfit and its distribution weight"""
+    outfit: str
+    weight: float = 1.0
 
-# Helper function to apply rules to a single prompt string
-def apply_rules_to_prompt(prompt_text, rules):
-    """Applies replacement rules to a prompt string."""
-    for old, new in rules:
-        # Use \b for word boundaries to avoid partial replacements
-        # re.escape handles special characters in 'old'
-        pattern = r'\b' + re.escape(old) + r'\b'
-        prompt_text = re.sub(pattern, new, prompt_text)
-    return prompt_text
+class PromptFileCache:
+    """Caches file contents to avoid repeated I/O operations"""
+    
+    def __init__(self):
+        self._cache: Dict[str, List[str]] = {}
+        self._file_mtimes: Dict[str, float] = {}
+    
+    def get_lines(self, filepath: str) -> List[str]:
+        """Get lines from file with caching and modification time checking"""
+        path = Path(filepath)
+        
+        if not path.exists():
+            logger.warning(f"File not found: {filepath}")
+            return []
+        
+        current_mtime = path.stat().st_mtime
+        
+        # Check if file was modified or not in cache
+        if (filepath not in self._cache or 
+            filepath not in self._file_mtimes or 
+            current_mtime != self._file_mtimes[filepath]):
+            
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                self._cache[filepath] = lines
+                self._file_mtimes[filepath] = current_mtime
+                logger.info(f"Loaded {len(lines)} lines from {filepath}")
+            except Exception as e:
+                logger.error(f"Error reading file {filepath}: {e}")
+                return []
+        
+        return self._cache[filepath]
 
-# Helper function to clean up commas and extra spaces
-def cleanup_prompt_tags(prompt_text):
-    """Cleans up comma formatting in a tag string."""
-    # Replace multiple commas (with optional spaces around them) with a single comma
-    prompt_text = re.sub(r'\s*,\s*(?:,\s*)+', ',', prompt_text)
-    # Remove leading/trailing commas and spaces
-    prompt_text = prompt_text.strip(' ,')
-    # Remove spaces around single commas
-    prompt_text = re.sub(r'\s*,\s*', ',', prompt_text)
-    # Further cleanup for potential empty tags if rules removed content
-    # e.g. "tag1,,tag2" or "tag1, ,tag2" should become "tag1,tag2"
-    tags = [tag.strip() for tag in prompt_text.split(',') if tag.strip()]
-    return ', '.join(tags) # Rejoin with consistent ", "
+class OutfitParser:
+    """Handles parsing and distribution of outfits using /CUT syntax"""
+    
+    SEPARATOR = "/CUT"
+    
+    @classmethod
+    def parse_outfits(cls, outfit_string: str) -> List[OutfitDistribution]:
+        """Parse outfit string with /CUT separators into distributions"""
+        if not outfit_string.strip():
+            return [OutfitDistribution("")]
+        
+        # Split by /CUT and clean up
+        parts = [part.strip() for part in outfit_string.split(cls.SEPARATOR)]
+        parts = [part for part in parts if part]  # Remove empty parts
+        
+        if not parts:
+            return [OutfitDistribution("")]
+        
+        # Create equal weight distributions
+        return [OutfitDistribution(outfit) for outfit in parts]
+    
+    @classmethod
+    def distribute_outfits(cls, outfits: List[OutfitDistribution], count: int, rng: random.Random) -> List[str]:
+        """Distribute outfits across count items based on weights"""
+        if not outfits or count <= 0:
+            return []
+        
+        # Calculate how many items each outfit should get
+        total_weight = sum(outfit.weight for outfit in outfits)
+        distributions = []
+        
+        remaining_count = count
+        for i, outfit in enumerate(outfits):
+            if i == len(outfits) - 1:  # Last outfit gets remaining
+                outfit_count = remaining_count
+            else:
+                outfit_count = int((outfit.weight / total_weight) * count)
+                remaining_count -= outfit_count
+            
+            distributions.extend([outfit.outfit] * outfit_count)
+        
+        # Shuffle to randomize distribution
+        rng.shuffle(distributions)
+        return distributions
 
-# Core logic function
-def generate_prompts_logic(s1_count, s2_count, s3_count,
-                           s1_outfit, s2_outfit, s3_outfit,
-                           rules_str, seed, base_path):
-    """
-    Generates prompts based on sections, outfits, rules, and seed.
-    base_path is the directory where 'sections' folder is located.
-    """
-    if seed is None or seed < 0: # ComfyUI often uses -1 for random seed
-        rng = random.Random() # New instance for non-deterministic
-    else:
-        rng = random.Random(seed)
+class ReplacementRuleEngine:
+    """Handles text replacement rules with improved pattern matching"""
+    
+    def __init__(self, rules_string: str):
+        self.rules = self._parse_rules(rules_string)
+    
+    def _parse_rules(self, rules_string: str) -> List[Tuple[str, str]]:
+        """Parse replacement rules with better error handling"""
+        rules = []
+        for line_num, line in enumerate(rules_string.splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith('#'):  # Skip empty lines and comments
+                continue
+            
+            if '->' not in line:
+                logger.warning(f"Invalid rule format on line {line_num}: {line}")
+                continue
+            
+            try:
+                old, new = line.split('->', 1)
+                rules.append((old.strip(), new.strip()))
+            except Exception as e:
+                logger.warning(f"Error parsing rule on line {line_num}: {e}")
+        
+        return rules
+    
+    def apply_rules(self, text: str) -> str:
+        """Apply replacement rules with improved regex handling"""
+        for old, new in self.rules:
+            if not old:  # Skip empty patterns
+                continue
+            
+            try:
+                # Use word boundaries for better matching, but handle special cases
+                if old.isalnum():
+                    pattern = r'\b' + re.escape(old) + r'\b'
+                else:
+                    pattern = re.escape(old)
+                
+                text = re.sub(pattern, new, text, flags=re.IGNORECASE)
+            except Exception as e:
+                logger.warning(f"Error applying rule '{old}' -> '{new}': {e}")
+        
+        return text
 
-    section_files = {
-        1: os.path.join(base_path, "sections", "section1.txt"),
-        2: os.path.join(base_path, "sections", "section2.txt"),
-        3: os.path.join(base_path, "sections", "section3.txt")
-    }
+class PromptCleaner:
+    """Handles cleaning and formatting of generated prompts"""
+    
+    @staticmethod
+    def cleanup_tags(text: str) -> str:
+        """Clean up comma formatting and remove empty tags"""
+        if not text:
+            return ""
+        
+        # Replace multiple commas with single comma
+        text = re.sub(r'\s*,\s*(?:,\s*)+', ',', text)
+        
+        # Split, clean, and rejoin tags
+        tags = []
+        for tag in text.split(','):
+            tag = tag.strip()
+            if tag and tag not in tags:  # Remove duplicates
+                tags.append(tag)
+        
+        return ', '.join(tags)
+    
+    @staticmethod
+    def combine_outfit_and_prompt(outfit: str, prompt: str) -> str:
+        """Combine outfit and prompt with proper formatting"""
+        parts = []
+        if outfit.strip():
+            parts.append(outfit.strip())
+        if prompt.strip():
+            parts.append(prompt.strip())
+        return ', '.join(parts)
 
-    s1_prompts_all = read_lines_from_file(section_files[1])
-    s2_prompts_all = read_lines_from_file(section_files[2])
-    s3_prompts_all = read_lines_from_file(section_files[3])
+class EnhancedRandomGenerator:
+    """Improved random number generator with better seeding"""
+    
+    def __init__(self, seed: Optional[int] = None):
+        if seed is None or seed < 0:
+            # Use system random for true randomness
+            self.rng = random.SystemRandom()
+            self.seed = None
+        else:
+            self.rng = random.Random(seed)
+            self.seed = seed
+    
+    def sample_unique(self, population: List, k: int) -> List:
+        """Sample without replacement, handling edge cases"""
+        if not population:
+            return []
+        
+        k = min(k, len(population))
+        if k <= 0:
+            return []
+        
+        return self.rng.sample(population, k)
+    
+    def shuffle(self, x: List) -> None:
+        """Shuffle list in place"""
+        self.rng.shuffle(x)
 
-    # Determine actual number of prompts to sample (min of requested and available)
-    num_s1_to_sample = min(s1_count, len(s1_prompts_all))
-    num_s2_to_sample = min(s2_count, len(s2_prompts_all))
-    num_s3_to_sample = min(s3_count, len(s3_prompts_all))
-
-    if s1_count > len(s1_prompts_all):
-        print(f"Warning: Requested {s1_count} prompts for section 1, but only {len(s1_prompts_all)} available. Using {len(s1_prompts_all)}.")
-    if s2_count > len(s2_prompts_all):
-        print(f"Warning: Requested {s2_count} prompts for section 2, but only {len(s2_prompts_all)} available. Using {len(s2_prompts_all)}.")
-    if s3_count > len(s3_prompts_all):
-        print(f"Warning: Requested {s3_count} prompts for section 3, but only {len(s3_prompts_all)} available. Using {len(s3_prompts_all)}.")
-
-    chosen_s1 = rng.sample(s1_prompts_all, num_s1_to_sample) if num_s1_to_sample > 0 else []
-    chosen_s2 = rng.sample(s2_prompts_all, num_s2_to_sample) if num_s2_to_sample > 0 else []
-    chosen_s3 = rng.sample(s3_prompts_all, num_s3_to_sample) if num_s3_to_sample > 0 else []
-
-    parsed_rules = parse_rules(rules_str)
-    final_prompts_list = []
-
-    # Process Section 1
-    for p in chosen_s1:
-        combined = f"{s1_outfit.strip()}, {p}" if s1_outfit.strip() else p
-        processed = apply_rules_to_prompt(combined, parsed_rules)
-        cleaned = cleanup_prompt_tags(processed)
-        if cleaned: # Only add if not empty after cleanup
-            final_prompts_list.append(cleaned)
-
-    # Process Section 2 (MODIFIED LOGIC HERE)
-    if chosen_s2: # Only process if there are s2 prompts
-        num_s2_total = len(chosen_s2)
-        # Calculate the number of prompts to get s2_outfit (first 40%)
-        # Ensure at least one prompt gets s2_outfit if num_s2_total is small but > 0, and s2_outfit is intended
-        # However, strict 40% means integer division will handle small numbers appropriately.
-        # For example, if num_s2_total is 1 or 2, 0.4 * num_s2_total will be 0.
-        # If num_s2_total is 3, 0.4 * 3 = 1.2 -> 1 prompt gets s2_outfit.
-        # If num_s2_total is 5, 0.4 * 5 = 2.0 -> 2 prompts get s2_outfit.
-        s2_outfit_count = int(num_s2_total * 0.4)
-
-        # First 40% of s2 prompts get s2_outfit
-        for i in range(s2_outfit_count):
-            p = chosen_s2[i]
-            current_outfit = s2_outfit.strip()
-            combined = f"{current_outfit}, {p}" if current_outfit else p
-            processed = apply_rules_to_prompt(combined, parsed_rules)
-            cleaned = cleanup_prompt_tags(processed)
-            if cleaned:
-                final_prompts_list.append(cleaned)
-
-        # Remaining s2 prompts get s3_outfit
-        for i in range(s2_outfit_count, num_s2_total):
-            p = chosen_s2[i]
-            current_outfit = s3_outfit.strip() # Use s3_outfit here
-            combined = f"{current_outfit}, {p}" if current_outfit else p
-            processed = apply_rules_to_prompt(combined, parsed_rules)
-            cleaned = cleanup_prompt_tags(processed)
-            if cleaned:
-                final_prompts_list.append(cleaned)
-
-    # Process Section 3
-    for p in chosen_s3:
-        combined = f"{s3_outfit.strip()}, {p}" if s3_outfit.strip() else p
-        processed = apply_rules_to_prompt(combined, parsed_rules)
-        cleaned = cleanup_prompt_tags(processed)
-        if cleaned:
-            final_prompts_list.append(cleaned)
-
-    return " / ".join(final_prompts_list)
-
+class PromptGeneratorCore:
+    """Core prompt generation logic with enhanced features"""
+    
+    def __init__(self, base_path: str):
+        self.base_path = Path(base_path)
+        self.sections_path = self.base_path / "sections"
+        self.file_cache = PromptFileCache()
+        
+        # Validate sections directory
+        if not self.sections_path.exists():
+            logger.warning(f"Sections directory not found: {self.sections_path}")
+    
+    def generate_prompts(self, 
+                        s1_count: int, s2_count: int, s3_count: int,
+                        s1_outfit: str, s2_outfit: str, s3_outfit: str,
+                        rules_string: str, seed: Optional[int] = None) -> str:
+        """Generate prompts with enhanced outfit distribution"""
+        
+        # Initialize random generator
+        rng = EnhancedRandomGenerator(seed)
+        
+        # Load section files
+        section_files = {
+            1: self.sections_path / "section1.txt",
+            2: self.sections_path / "section2.txt", 
+            3: self.sections_path / "section3.txt"
+        }
+        
+        section_prompts = {}
+        for section, filepath in section_files.items():
+            section_prompts[section] = self.file_cache.get_lines(str(filepath))
+        
+        # Initialize rule engine and cleaner
+        rule_engine = ReplacementRuleEngine(rules_string)
+        cleaner = PromptCleaner()
+        
+        # Parse outfit distributions
+        s1_outfits = OutfitParser.parse_outfits(s1_outfit)
+        s2_outfits = OutfitParser.parse_outfits(s2_outfit)
+        s3_outfits = OutfitParser.parse_outfits(s3_outfit)
+        
+        final_prompts = []
+        
+        # Process each section
+        for section_num, count, outfit_distributions in [
+            (1, s1_count, s1_outfits),
+            (2, s2_count, s2_outfits),
+            (3, s3_count, s3_outfits)
+        ]:
+            if count <= 0:
+                continue
+            
+            available_prompts = section_prompts.get(section_num, [])
+            if not available_prompts:
+                logger.warning(f"No prompts available for section {section_num}")
+                continue
+            
+            # Sample prompts
+            actual_count = min(count, len(available_prompts))
+            if count > len(available_prompts):
+                logger.warning(f"Requested {count} prompts for section {section_num}, "
+                             f"but only {len(available_prompts)} available. Using {actual_count}.")
+            
+            chosen_prompts = rng.sample_unique(available_prompts, actual_count)
+            
+            # Distribute outfits
+            outfit_assignments = OutfitParser.distribute_outfits(
+                outfit_distributions, actual_count, rng.rng
+            )
+            
+            # Combine and process prompts
+            for prompt, outfit in zip(chosen_prompts, outfit_assignments):
+                combined = cleaner.combine_outfit_and_prompt(outfit, prompt)
+                processed = rule_engine.apply_rules(combined)
+                cleaned = cleaner.cleanup_tags(processed)
+                
+                if cleaned:
+                    final_prompts.append(cleaned)
+        
+        return " / ".join(final_prompts)
 
 class PromptGeneratorNode:
+    """ComfyUI Node wrapper with enhanced functionality"""
+    
     def __init__(self):
-        # Get the directory of the current script
-        # This is important for finding the 'sections' folder relative to the node
-        self.base_dir = os.path.dirname(os.path.realpath(__file__))
-
+        self.base_dir = Path(__file__).parent
+        self.generator = PromptGeneratorCore(str(self.base_dir))
+    
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -154,142 +293,138 @@ class PromptGeneratorNode:
                 "s1_prompt_count": ("INT", {"default": 1, "min": 0, "max": 100, "step": 1}),
                 "s2_prompt_count": ("INT", {"default": 1, "min": 0, "max": 100, "step": 1}),
                 "s3_prompt_count": ("INT", {"default": 1, "min": 0, "max": 100, "step": 1}),
-                "s1_outfit": ("STRING", {"multiline": True, "default": "masterpiece, best quality"}),
-                "s2_outfit": ("STRING", {"multiline": True, "default": ""}),
-                "s3_outfit": ("STRING", {"multiline": True, "default": ""}),
+                "s1_outfit": ("STRING", {
+                    "multiline": True, 
+                    "default": "masterpiece, best quality",
+                    "placeholder": "Use /CUT to separate multiple outfits: outfit1 /CUT outfit2"
+                }),
+                "s2_outfit": ("STRING", {
+                    "multiline": True, 
+                    "default": "",
+                    "placeholder": "Use /CUT to separate multiple outfits"
+                }),
+                "s3_outfit": ("STRING", {
+                    "multiline": True, 
+                    "default": "",
+                    "placeholder": "Use /CUT to separate multiple outfits"
+                }),
                 "replacement_rules": ("STRING", {
                     "multiline": True,
-                    "default": "1boy->1man, pale_skin\nsweat->sweat, water_drops, wet\nnavel->"
+                    "default": "# Replacement rules (one per line)\n1boy->1man\nsweat->sweat, water_drops, wet\nnavel->",
+                    "placeholder": "Format: old_text->new_text (one per line, # for comments)"
                 }),
-                "seed": ("INT", {"default": 0, "min": -1, "max": 0xffffffffffffffff}), # -1 for random in Comfy often
+                "seed": ("INT", {"default": -1, "min": -1, "max": 0xffffffffffffffff}),
             }
         }
-
+    
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("generated_prompts",)
     FUNCTION = "generate_prompts"
-    CATEGORY = "Prompt Utilities/PackCREATOR_BOLADEX"
-
+    CATEGORY = "Prompt Utilities/Enhanced_BOLADEX"
+    
     def generate_prompts(self, s1_prompt_count, s2_prompt_count, s3_prompt_count,
-                         s1_outfit, s2_outfit, s3_outfit,
-                         replacement_rules, seed):
+                        s1_outfit, s2_outfit, s3_outfit, replacement_rules, seed):
+        
+        # Convert -1 to None for random seed
+        actual_seed = None if seed == -1 else seed
+        
+        try:
+            result = self.generator.generate_prompts(
+                s1_prompt_count, s2_prompt_count, s3_prompt_count,
+                s1_outfit, s2_outfit, s3_outfit,
+                replacement_rules, actual_seed
+            )
+            return (result,)
+        except Exception as e:
+            logger.error(f"Error generating prompts: {e}")
+            return (f"Error: {str(e)}",)
 
-        generated_string = generate_prompts_logic(
-            s1_prompt_count, s2_prompt_count, s3_prompt_count,
-            s1_outfit, s2_outfit, s3_outfit,
-            replacement_rules, seed,
-            self.base_dir # Pass the base directory of the node
-        )
-        return (generated_string,)
-
-# Example usage (for testing outside ComfyUI)
+# Example usage and testing
 if __name__ == "__main__":
-    # Create dummy section files in a 'sections' subdirectory relative to this script
-    script_dir = os.path.dirname(os.path.realpath(__file__))
-    sections_dir = os.path.join(script_dir, "sections")
-    os.makedirs(sections_dir, exist_ok=True)
-
-    with open(os.path.join(sections_dir, "section1.txt"), "w") as f:
-        f.write("s1_prompt_A, blue_sky, 1girl, solo, sweat\n")
-        f.write("s1_prompt_B, sunny_day, landscape, mountains, navel\n")
-        f.write("s1_prompt_C, forest_path, green_trees, sunlight, 1boy\n")
-
-    with open(os.path.join(sections_dir, "section2.txt"), "w") as f:
-        f.write("s2_prompt_1, detailed_face, happy_smile, looking_at_viewer, sweat\n")
-        f.write("s2_prompt_2, dynamic_pose, action_shot, blurred_background\n")
-        f.write("s2_prompt_3, close_up, thoughtful_expression\n")
-        f.write("s2_prompt_4, side_view, walking_fast\n")
-        f.write("s2_prompt_5, from_above, sitting_on_ground\n")
-
-
-    with open(os.path.join(sections_dir, "section3.txt"), "w") as f:
-        f.write("s3_prompt_X, cyberpunk_city, neon_lights, rain, 1boy\n")
-        f.write("s3_prompt_Y, ancient_ruins, overgrown_vines\n")
-
-
-    print(f"Testing with base_dir: {script_dir}")
-
-    # Test the core logic function with the new S2 outfit distribution
-    # Request 5 prompts for S2 to see the 40/60 split (2 with s2_outfit, 3 with s3_outfit)
-    result = generate_prompts_logic(
-        s1_count=1, s2_count=5, s3_count=1,
-        s1_outfit="STYLE_S1, red_dress",
-        s2_outfit="STYLE_S2, green_shirt", # This will be for first 40% of S2
-        s3_outfit="STYLE_S3, yellow_hat",  # This will be for last 60% of S2 and all S3
-        rules_str="1boy->1man, pale_skin\nsweat->sweat, water_drops, wet\nnavel->\nred_dress->blue_dress",
-        seed=42, # Use a fixed seed for predictable sampling
-        base_path=script_dir
-    )
-    print("\n--- Generated Prompts (Logic Test with S2 Split) ---")
-    # To make output predictable, let's see which s2 prompts are chosen with seed 42
-    # and how they are processed.
-    # Assuming section2.txt content above and seed 42, rng.sample(s2_prompts_all, 5) will pick all 5
-    # in a specific shuffled order. The split is then applied to this shuffled order.
-    # For actual predictable order for this test, let's ensure s2_prompts_all is not shuffled before this test call
-    # or manually sort chosen_s2 for this test print if needed (but the function uses rng.sample as intended)
-
-    # To make the test output more clear about which original S2 prompt gets which outfit,
-    # we'd need to know the exact order `rng.sample` returns for `chosen_s2` with seed 42.
-    # For now, we just observe the count of outfits.
-    print(result)
-    print("Expected: 1 S1 prompt with STYLE_S1. 2 S2 prompts with STYLE_S2. 3 S2 prompts with STYLE_S3. 1 S3 prompt with STYLE_S3.")
-    print("----------------------------------------------------\n")
-
-
-    # Test the node class (simulating ComfyUI call)
-    node_instance = PromptGeneratorNode()
-    # Test with s2_count that allows split (e.g., 5)
-    output_tuple = node_instance.generate_prompts(
-        s1_prompt_count=1,
-        s2_prompt_count=5, # To see the split
-        s3_prompt_count=1,
-        s1_outfit="ultra_detailed_S1, 8k",
-        s2_outfit="cinematic_S2",
-        s3_outfit="sketchy_S3", # This will be used for some S2 and all S3
-        replacement_rules="1girl->1woman\nmountains->snowy_mountains",
-        seed=123 # Different seed for different sampling
-    )
-    print("--- Generated Prompts (Node Test with S2 Split) ---")
-    print(output_tuple[0])
-    print("Expected: 1 S1 prompt with ultra_detailed_S1. 2 S2 prompts with cinematic_S2. 3 S2 prompts with sketchy_S3. 1 S3 prompt with sketchy_S3.")
-    print("-----------------------------------------------\n")
-
-    # Test with fewer S2 prompts than the 40% threshold calculation would naturally split
-    # e.g. s2_count = 1. 40% of 1 is 0 (int(0.4)). So it should get s3_outfit.
-    # e.g. s2_count = 2. 40% of 2 is 0 (int(0.8)). Both should get s3_outfit.
-    # e.g. s2_count = 3. 40% of 3 is 1 (int(1.2)). 1 gets s2_outfit, 2 get s3_outfit.
-    result_small_s2 = generate_prompts_logic(
-        s1_count=0, s2_count=2, s3_count=0,
-        s1_outfit="S1O",
-        s2_outfit="S2O_FOR_40_PERCENT",
-        s3_outfit="S3O_FOR_60_PERCENT_AND_S3",
-        rules_str="", seed=1, base_path=script_dir
-    )
-    print("--- Generated Prompts (Small S2 Count Test) ---")
-    print(f"s2_count=2: {result_small_s2}")
-    print("Expected for s2_count=2: Both S2 prompts should get S3O_FOR_60_PERCENT_AND_S3 (because 0.4*2 = 0.8, int(0.8)=0 for s2_outfit_count)")
-    print("---------------------------------------------\n")
-
-    result_small_s2_3 = generate_prompts_logic(
-        s1_count=0, s2_count=3, s3_count=0,
-        s1_outfit="S1O",
-        s2_outfit="S2O_FOR_40_PERCENT",
-        s3_outfit="S3O_FOR_60_PERCENT_AND_S3",
-        rules_str="", seed=1, base_path=script_dir
-    )
-    print("--- Generated Prompts (Small S2 Count Test) ---")
-    print(f"s2_count=3: {result_small_s2_3}")
-    print("Expected for s2_count=3: First S2 prompt (from sampled list) gets S2O, next two S2 prompts get S3O (0.4*3=1.2, int(1.2)=1)")
-    print("---------------------------------------------\n")
-
-    # Test with more prompts than available (original test)
-    result_overflow = generate_prompts_logic(
-        s1_count=10, s2_count=1, s3_count=0, # s2_count=1 means it should get s3_outfit
-        s1_outfit="overflow_style_S1",
-        s2_outfit="overflow_style_S2",
-        s3_outfit="overflow_style_S3",
-        rules_str="", seed=1, base_path=script_dir
-    )
-    print("--- Generated Prompts (Overflow Test with S2 Split logic) ---")
-    print(result_overflow) # The single s2 prompt should have overflow_style_S3
-    print("-----------------------------------------------------------\n")
+    import tempfile
+    import shutil
+    
+    # Create test environment
+    test_dir = Path(tempfile.mkdtemp())
+    sections_dir = test_dir / "sections"
+    sections_dir.mkdir()
+    
+    try:
+        # Create test files
+        test_data = {
+            "section1.txt": [
+                "portrait, beautiful woman, detailed face",
+                "landscape, mountains, sunset",
+                "cyberpunk, neon lights, city",
+                "fantasy, magic, wizard"
+            ],
+            "section2.txt": [
+                "dynamic pose, action shot",
+                "close-up, intimate lighting",
+                "wide angle, dramatic composition",
+                "macro photography, detailed textures",
+                "aerial view, bird's eye perspective"
+            ],
+            "section3.txt": [
+                "professional lighting, studio setup",
+                "natural lighting, golden hour",
+                "dramatic shadows, high contrast"
+            ]
+        }
+        
+        for filename, lines in test_data.items():
+            with open(sections_dir / filename, 'w') as f:
+                f.write('\n'.join(lines))
+        
+        # Test the enhanced generator
+        generator = PromptGeneratorCore(str(test_dir))
+        
+        print("=== Enhanced Prompt Generator Test ===")
+        
+        # Test 1: Multiple outfits with /CUT
+        print("\n--- Test 1: Multiple Outfits ---")
+        result1 = generator.generate_prompts(
+            s1_count=4, s2_count=4, s3_count=2,
+            s1_outfit="red dress /CUT blue shirt /CUT green jacket",
+            s2_outfit="casual wear /CUT formal attire",
+            s3_outfit="vintage style",
+            rules_string="woman->lady\nbeautiful->gorgeous",
+            seed=42
+        )
+        print(f"Result: {result1}")
+        
+        # Test 2: Empty outfit handling
+        print("\n--- Test 2: Empty Outfits ---")
+        result2 = generator.generate_prompts(
+            s1_count=2, s2_count=0, s3_count=1,
+            s1_outfit="",
+            s2_outfit="should not appear",
+            s3_outfit="only style",
+            rules_string="",
+            seed=123
+        )
+        print(f"Result: {result2}")
+        
+        # Test 3: Complex rules
+        print("\n--- Test 3: Complex Rules ---")
+        result3 = generator.generate_prompts(
+            s1_count=2, s2_count=2, s3_count=1,
+            s1_outfit="masterpiece /CUT high quality",
+            s2_outfit="detailed",
+            s3_outfit="artistic",
+            rules_string="""
+            # Character replacements
+            woman->elegant woman
+            lighting->professional lighting
+            # Remove unwanted terms
+            detailed->
+            """,
+            seed=456
+        )
+        print(f"Result: {result3}")
+        
+        print("\n=== All tests completed ===")
+        
+    finally:
+        # Cleanup
+        shutil.rmtree(test_dir)

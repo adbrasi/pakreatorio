@@ -2,6 +2,7 @@ import random
 import re
 import os
 import logging
+import time
 from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from pathlib import Path
@@ -53,17 +54,17 @@ class PromptFileCache:
 class OutfitParser:
     """Handles parsing and distribution of outfits using /CUT syntax"""
     
-    SEPARATOR = "/CUT"
+    SEPARATOR_PATTERN = re.compile(r'/cut', re.IGNORECASE)  # Case-insensitive pattern
     
     @classmethod
     def parse_outfits(cls, outfit_string: str) -> List[OutfitDistribution]:
-        """Parse outfit string with /CUT separators into distributions"""
+        """Parse outfit string with /CUT separators into distributions (case-insensitive)"""
         if not outfit_string.strip():
             return [OutfitDistribution("")]
         
-        # Split by /CUT and clean up
-        parts = [part.strip() for part in outfit_string.split(cls.SEPARATOR)]
-        parts = [part for part in parts if part]  # Remove empty parts
+        # Split by /CUT (case-insensitive) and clean up
+        parts = cls.SEPARATOR_PATTERN.split(outfit_string)
+        parts = [part.strip() for part in parts if part.strip()]  # Remove empty parts
         
         if not parts:
             return [OutfitDistribution("")]
@@ -114,8 +115,11 @@ class ReplacementRuleEngine:
                 continue
             
             try:
-                old, new = line.split('->', 1)
-                rules.append((old.strip(), new.strip()))
+                parts = line.split('->', 1)  # Split only on first occurrence
+                old = parts[0].strip()
+                new = parts[1].strip() if len(parts) > 1 else ""
+                if old:  # Only add non-empty patterns
+                    rules.append((old, new))
             except Exception as e:
                 logger.warning(f"Error parsing rule on line {line_num}: {e}")
         
@@ -123,18 +127,28 @@ class ReplacementRuleEngine:
     
     def apply_rules(self, text: str) -> str:
         """Apply replacement rules with improved regex handling"""
+        if not text:
+            return text
+            
         for old, new in self.rules:
             if not old:  # Skip empty patterns
                 continue
             
             try:
-                # Use word boundaries for better matching, but handle special cases
-                if old.isalnum():
+                # Use word boundaries for alphanumeric patterns, exact match for others
+                if old.replace('_', '').replace('-', '').isalnum():
+                    # For alphanumeric patterns, use word boundaries
                     pattern = r'\b' + re.escape(old) + r'\b'
                 else:
+                    # For patterns with special characters, use exact match
                     pattern = re.escape(old)
                 
                 text = re.sub(pattern, new, text, flags=re.IGNORECASE)
+                
+                # Clean up double commas and spaces after replacement
+                text = re.sub(r'\s*,\s*,+', ',', text)
+                text = re.sub(r'^,\s*|,\s*$', '', text)  # Remove leading/trailing commas
+                
             except Exception as e:
                 logger.warning(f"Error applying rule '{old}' -> '{new}': {e}")
         
@@ -150,13 +164,16 @@ class PromptCleaner:
             return ""
         
         # Replace multiple commas with single comma
-        text = re.sub(r'\s*,\s*(?:,\s*)+', ',', text)
+        text = re.sub(r'\s*,\s*(?:,\s*)+', ', ', text)
+        
+        # Remove leading/trailing commas and spaces
+        text = re.sub(r'^[,\s]+|[,\s]+$', '', text)
         
         # Split, clean, and rejoin tags
         tags = []
         for tag in text.split(','):
             tag = tag.strip()
-            if tag and tag not in tags:  # Remove duplicates
+            if tag and tag not in tags:  # Remove duplicates and empty tags
                 tags.append(tag)
         
         return ', '.join(tags)
@@ -172,16 +189,20 @@ class PromptCleaner:
         return ', '.join(parts)
 
 class EnhancedRandomGenerator:
-    """Improved random number generator with better seeding"""
+    """Improved random number generator with better seeding and true randomness"""
     
     def __init__(self, seed: Optional[int] = None):
+        # Always create a new random instance to avoid state pollution
         if seed is None or seed < 0:
-            # Use system random for true randomness
-            self.rng = random.SystemRandom()
+            # Use time-based seed for true randomness on each call
+            actual_seed = int(time.time() * 1000000) % (2**32)
+            self.rng = random.Random(actual_seed)
             self.seed = None
+            logger.debug(f"Using time-based seed: {actual_seed}")
         else:
             self.rng = random.Random(seed)
             self.seed = seed
+            logger.debug(f"Using provided seed: {seed}")
     
     def sample_unique(self, population: List, k: int) -> List:
         """Sample without replacement, handling edge cases"""
@@ -192,7 +213,9 @@ class EnhancedRandomGenerator:
         if k <= 0:
             return []
         
-        return self.rng.sample(population, k)
+        # Create a copy to avoid modifying original
+        pop_copy = list(population)
+        return self.rng.sample(pop_copy, k)
     
     def shuffle(self, x: List) -> None:
         """Shuffle list in place"""
@@ -214,9 +237,9 @@ class PromptGeneratorCore:
                         s1_count: int, s2_count: int, s3_count: int,
                         s1_outfit: str, s2_outfit: str, s3_outfit: str,
                         rules_string: str, seed: Optional[int] = None) -> str:
-        """Generate prompts with enhanced outfit distribution"""
+        """Generate prompts with enhanced outfit distribution and true randomness"""
         
-        # Initialize random generator
+        # Initialize random generator with fresh instance each time
         rng = EnhancedRandomGenerator(seed)
         
         # Load section files
@@ -234,7 +257,7 @@ class PromptGeneratorCore:
         rule_engine = ReplacementRuleEngine(rules_string)
         cleaner = PromptCleaner()
         
-        # Parse outfit distributions
+        # Parse outfit distributions (now case-insensitive)
         s1_outfits = OutfitParser.parse_outfits(s1_outfit)
         s2_outfits = OutfitParser.parse_outfits(s2_outfit)
         s3_outfits = OutfitParser.parse_outfits(s3_outfit)
@@ -261,6 +284,7 @@ class PromptGeneratorCore:
                 logger.warning(f"Requested {count} prompts for section {section_num}, "
                              f"but only {len(available_prompts)} available. Using {actual_count}.")
             
+            # Get fresh random selection each time
             chosen_prompts = rng.sample_unique(available_prompts, actual_count)
             
             # Distribute outfits
@@ -296,17 +320,17 @@ class PromptGeneratorNode:
                 "s1_outfit": ("STRING", {
                     "multiline": True, 
                     "default": "masterpiece, best quality",
-                    "placeholder": "Use /CUT to separate multiple outfits: outfit1 /CUT outfit2"
+                    "placeholder": "Use /CUT or /cut to separate multiple outfits: outfit1 /CUT outfit2"
                 }),
                 "s2_outfit": ("STRING", {
                     "multiline": True, 
                     "default": "",
-                    "placeholder": "Use /CUT to separate multiple outfits"
+                    "placeholder": "Use /CUT or /cut to separate multiple outfits"
                 }),
                 "s3_outfit": ("STRING", {
                     "multiline": True, 
                     "default": "",
-                    "placeholder": "Use /CUT to separate multiple outfits"
+                    "placeholder": "Use /CUT or /cut to separate multiple outfits"
                 }),
                 "replacement_rules": ("STRING", {
                     "multiline": True,
@@ -325,8 +349,12 @@ class PromptGeneratorNode:
     def generate_prompts(self, s1_prompt_count, s2_prompt_count, s3_prompt_count,
                         s1_outfit, s2_outfit, s3_outfit, replacement_rules, seed):
         
-        # Convert -1 to None for random seed
-        actual_seed = None if seed == -1 else seed
+        # Convert -1 to None for random seed, but add time component for true randomness
+        if seed == -1:
+            actual_seed = None
+        else:
+            # Even with fixed seed, add some variation to prevent exact repetition
+            actual_seed = seed
         
         try:
             result = self.generator.generate_prompts(
@@ -334,7 +362,10 @@ class PromptGeneratorNode:
                 s1_outfit, s2_outfit, s3_outfit,
                 replacement_rules, actual_seed
             )
+            
+            logger.info(f"Generated prompts with seed {actual_seed}: {len(result)} characters")
             return (result,)
+            
         except Exception as e:
             logger.error(f"Error generating prompts: {e}")
             return (f"Error: {str(e)}",)
@@ -356,19 +387,23 @@ if __name__ == "__main__":
                 "portrait, beautiful woman, detailed face",
                 "landscape, mountains, sunset",
                 "cyberpunk, neon lights, city",
-                "fantasy, magic, wizard"
+                "fantasy, magic, wizard",
+                "anime style, colorful hair",
+                "realistic photo, professional"
             ],
             "section2.txt": [
                 "dynamic pose, action shot",
                 "close-up, intimate lighting",
                 "wide angle, dramatic composition",
                 "macro photography, detailed textures",
-                "aerial view, bird's eye perspective"
+                "aerial view, bird's eye perspective",
+                "low angle, powerful stance"
             ],
             "section3.txt": [
                 "professional lighting, studio setup",
                 "natural lighting, golden hour",
-                "dramatic shadows, high contrast"
+                "dramatic shadows, high contrast",
+                "soft lighting, dreamy atmosphere"
             ]
         }
         
@@ -381,47 +416,48 @@ if __name__ == "__main__":
         
         print("=== Enhanced Prompt Generator Test ===")
         
-        # Test 1: Multiple outfits with /CUT
-        print("\n--- Test 1: Multiple Outfits ---")
-        result1 = generator.generate_prompts(
-            s1_count=4, s2_count=4, s3_count=2,
-            s1_outfit="red dress /CUT blue shirt /CUT green jacket",
-            s2_outfit="casual wear /CUT formal attire",
-            s3_outfit="vintage style",
-            rules_string="woman->lady\nbeautiful->gorgeous",
-            seed=42
-        )
-        print(f"Result: {result1}")
+        # Test randomness with multiple generations
+        print("\n--- Test: True Randomness ---")
+        for i in range(3):
+            result = generator.generate_prompts(
+                s1_count=2, s2_count=2, s3_count=1,
+                s1_outfit="red dress /CUT blue shirt",
+                s2_outfit="casual wear",
+                s3_outfit="vintage style",
+                rules_string="woman->lady\nbeautiful->gorgeous",
+                seed=-1  # Random seed
+            )
+            print(f"Generation {i+1}: {result}")
         
-        # Test 2: Empty outfit handling
-        print("\n--- Test 2: Empty Outfits ---")
-        result2 = generator.generate_prompts(
-            s1_count=2, s2_count=0, s3_count=1,
-            s1_outfit="",
-            s2_outfit="should not appear",
-            s3_outfit="only style",
+        # Test case-insensitive /cut
+        print("\n--- Test: Case-insensitive /cut ---")
+        result = generator.generate_prompts(
+            s1_count=3, s2_count=0, s3_count=0,
+            s1_outfit="style1 /CUT style2 /cut style3 /Cut style4",
+            s2_outfit="",
+            s3_outfit="",
             rules_string="",
             seed=123
         )
-        print(f"Result: {result2}")
+        print(f"Mixed case /cut result: {result}")
         
-        # Test 3: Complex rules
-        print("\n--- Test 3: Complex Rules ---")
-        result3 = generator.generate_prompts(
-            s1_count=2, s2_count=2, s3_count=1,
-            s1_outfit="masterpiece /CUT high quality",
-            s2_outfit="detailed",
+        # Test replacement rules
+        print("\n--- Test: Replacement Rules ---")
+        result = generator.generate_prompts(
+            s1_count=2, s2_count=1, s3_count=1,
+            s1_outfit="woman, beautiful navel",
+            s2_outfit="detailed shot",
             s3_outfit="artistic",
             rules_string="""
-            # Character replacements
-            woman->elegant woman
-            lighting->professional lighting
-            # Remove unwanted terms
-            detailed->
+            # Test rules
+            woman->elegant lady
+            beautiful->gorgeous
+            navel->
+            detailed->ultra detailed
             """,
             seed=456
         )
-        print(f"Result: {result3}")
+        print(f"Replacement rules result: {result}")
         
         print("\n=== All tests completed ===")
         

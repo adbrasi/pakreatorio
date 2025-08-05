@@ -18,7 +18,11 @@ class OutfitDistribution:
     weight: float = 1.0
 
 class PromptFileCache:
-    """Caches file contents to avoid repeated I/O operations"""
+    """Caches file contents to avoid repeated I/O operations
+    
+    Note: This cache only stores file contents, NOT random selections.
+    Each prompt generation creates fresh random selections from cached file data.
+    """
     
     def __init__(self):
         self._cache: Dict[str, List[str]] = {}
@@ -236,22 +240,35 @@ class PromptGeneratorCore:
     def generate_prompts(self, 
                         s1_count: int, s2_count: int, s3_count: int,
                         s1_outfit: str, s2_outfit: str, s3_outfit: str,
-                        rules_string: str, seed: Optional[int] = None) -> str:
+                        rules_string: str, version_type: str = "FULL", 
+                        pingpong: bool = False, seed: Optional[int] = None) -> str:
         """Generate prompts with enhanced outfit distribution and true randomness"""
         
         # Initialize random generator with fresh instance each time
+        # For true randomness, we ensure each call gets a unique random state
         rng = EnhancedRandomGenerator(seed)
         
-        # Load section files
-        section_files = {
-            1: self.sections_path / "section1.txt",
-            2: self.sections_path / "section2.txt", 
-            3: self.sections_path / "section3.txt"
-        }
-        
+        # Load section files based on version type
         section_prompts = {}
-        for section, filepath in section_files.items():
-            section_prompts[section] = self.file_cache.get_lines(str(filepath))
+        
+        def load_section_prompts(section_num: int) -> List[str]:
+            """Load prompts for a section based on version_type and pingpong settings"""
+            v1_file = self.sections_path / f"section{section_num}.txt"
+            v2_file = self.sections_path / f"section{section_num}V2.txt"
+            
+            if version_type == "V1":
+                return self.file_cache.get_lines(str(v1_file))
+            elif version_type == "V2":
+                return self.file_cache.get_lines(str(v2_file))
+            elif version_type == "FULL":
+                v1_prompts = self.file_cache.get_lines(str(v1_file))
+                v2_prompts = self.file_cache.get_lines(str(v2_file))
+                return {"v1": v1_prompts, "v2": v2_prompts}
+            
+            return []
+        
+        for section in [1, 2, 3]:
+            section_prompts[section] = load_section_prompts(section)
         
         # Initialize rule engine and cleaner
         rule_engine = ReplacementRuleEngine(rules_string)
@@ -273,23 +290,71 @@ class PromptGeneratorCore:
             if count <= 0:
                 continue
             
-            available_prompts = section_prompts.get(section_num, [])
-            if not available_prompts:
+            section_data = section_prompts.get(section_num, [])
+            if not section_data:
                 logger.warning(f"No prompts available for section {section_num}")
                 continue
             
-            # Sample prompts
-            actual_count = min(count, len(available_prompts))
-            if count > len(available_prompts):
-                logger.warning(f"Requested {count} prompts for section {section_num}, "
-                             f"but only {len(available_prompts)} available. Using {actual_count}.")
+            # Handle different version types
+            if version_type in ["V1", "V2"]:
+                # Simple case: use single file
+                available_prompts = section_data
+                if not available_prompts:
+                    logger.warning(f"No prompts available for section {section_num}")
+                    continue
+                
+                actual_count = min(count, len(available_prompts))
+                if count > len(available_prompts):
+                    logger.warning(f"Requested {count} prompts for section {section_num}, "
+                                 f"but only {len(available_prompts)} available. Using {actual_count}.")
+                
+                chosen_prompts = rng.sample_unique(available_prompts, actual_count)
+                
+            elif version_type == "FULL":
+                # Complex case: choose from both files
+                v1_prompts = section_data.get("v1", [])
+                v2_prompts = section_data.get("v2", [])
+                
+                if not v1_prompts and not v2_prompts:
+                    logger.warning(f"No prompts available for section {section_num}")
+                    continue
+                
+                chosen_prompts = []
+                
+                if pingpong:
+                    # Alternate between files - each selection is fresh and random
+                    for i in range(count):
+                        if i % 2 == 0:  # Even index: use V1
+                            if v1_prompts:
+                                # Fresh random choice from V1 file
+                                chosen_prompts.append(rng.rng.choice(v1_prompts))
+                            elif v2_prompts:
+                                chosen_prompts.append(rng.rng.choice(v2_prompts))
+                        else:  # Odd index: use V2
+                            if v2_prompts:
+                                # Fresh random choice from V2 file
+                                chosen_prompts.append(rng.rng.choice(v2_prompts))
+                            elif v1_prompts:
+                                chosen_prompts.append(rng.rng.choice(v1_prompts))
+                else:
+                    # Random selection from both files
+                    combined_prompts = []
+                    if v1_prompts:
+                        combined_prompts.extend([("v1", prompt) for prompt in v1_prompts])
+                    if v2_prompts:
+                        combined_prompts.extend([("v2", prompt) for prompt in v2_prompts])
+                    
+                    if combined_prompts:
+                        actual_count = min(count, len(combined_prompts))
+                        selected = rng.sample_unique(combined_prompts, actual_count)
+                        chosen_prompts = [prompt for _, prompt in selected]
             
-            # Get fresh random selection each time
-            chosen_prompts = rng.sample_unique(available_prompts, actual_count)
+            if not chosen_prompts:
+                continue
             
             # Distribute outfits
             outfit_assignments = OutfitParser.distribute_outfits(
-                outfit_distributions, actual_count, rng.rng
+                outfit_distributions, len(chosen_prompts), rng.rng
             )
             
             # Combine and process prompts
@@ -314,6 +379,8 @@ class PromptGeneratorNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "version_type": (["FULL", "V1", "V2"], {"default": "FULL"}),
+                "pingpong": ("BOOLEAN", {"default": False}),
                 "s1_prompt_count": ("INT", {"default": 1, "min": 0, "max": 100, "step": 1}),
                 "s2_prompt_count": ("INT", {"default": 1, "min": 0, "max": 100, "step": 1}),
                 "s3_prompt_count": ("INT", {"default": 1, "min": 0, "max": 100, "step": 1}),
@@ -346,7 +413,7 @@ class PromptGeneratorNode:
     FUNCTION = "generate_prompts"
     CATEGORY = "Prompt Utilities/Enhanced_BOLADEX"
     
-    def generate_prompts(self, s1_prompt_count, s2_prompt_count, s3_prompt_count,
+    def generate_prompts(self, version_type, pingpong, s1_prompt_count, s2_prompt_count, s3_prompt_count,
                         s1_outfit, s2_outfit, s3_outfit, replacement_rules, seed):
         
         # Convert -1 to None for random seed, but add time component for true randomness
@@ -360,7 +427,7 @@ class PromptGeneratorNode:
             result = self.generator.generate_prompts(
                 s1_prompt_count, s2_prompt_count, s3_prompt_count,
                 s1_outfit, s2_outfit, s3_outfit,
-                replacement_rules, actual_seed
+                replacement_rules, version_type, pingpong, actual_seed
             )
             
             logger.info(f"Generated prompts with seed {actual_seed}: {len(result)} characters")
